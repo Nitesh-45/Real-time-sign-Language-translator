@@ -1,6 +1,7 @@
 streamlit
 streamlit-webrtc
 av
+tornado<7
 opencv-python-headless==4.11.0.86
 mediapipe
 scikit-learn
