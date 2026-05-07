@@ -1820,6 +1820,9 @@ def render_quiz_mode() -> None:
     with feedback_slot.container():
         render_status_badge("info", f"ℹ️ {st.session_state.quiz_feedback}")
 
+    quiz_limit = int(st.session_state.get("quiz_limit", 5))
+    quiz_completed = int(st.session_state.get("quiz_completed_questions", 0))
+
     st.markdown('<div class="section-title">Browser Webcam Feed</div>', unsafe_allow_html=True)
     ctx = webrtc_streamer(
         key="quiz-browser-webcam",
@@ -1829,8 +1832,8 @@ def render_quiz_mode() -> None:
         video_processor_factory=lambda: QuizVideoProcessor(
             predictor,
             quiz,
-            int(st.session_state.quiz_limit),
-            int(st.session_state.quiz_completed_questions),
+            quiz_limit,
+            quiz_completed,
         ),
         async_processing=True,
     )
@@ -1863,9 +1866,9 @@ def render_quiz_mode() -> None:
 
     while ctx.state.playing:
         ctx.video_processor.update_settings(
-            int(st.session_state.quiz_limit),
-            int(st.session_state.quiz_completed_questions),
-            bool(st.session_state.quiz_finished),
+            int(st.session_state.get("quiz_limit", 5)),
+            int(st.session_state.get("quiz_completed_questions", 0)),
+            bool(st.session_state.get("quiz_finished", False)),
         )
         state = ctx.video_processor.get_state()
         label = state["label"]

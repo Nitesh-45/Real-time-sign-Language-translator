@@ -1,3 +1,4 @@
+import importlib
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -63,9 +64,26 @@ class HandTracker:
             self.initialization_error = MEDIAPIPE_IMPORT_ERROR
             return
 
-        self.mp_hands = mp.solutions.hands
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_styles = mp.solutions.drawing_styles
+        try:
+            self.mp_hands = mp.solutions.hands
+            self.mp_drawing = mp.solutions.drawing_utils
+            self.mp_styles = mp.solutions.drawing_styles
+        except AttributeError:
+            try:
+                self.mp_hands = importlib.import_module("mediapipe.python.solutions.hands")
+                self.mp_drawing = importlib.import_module(
+                    "mediapipe.python.solutions.drawing_utils"
+                )
+                self.mp_styles = importlib.import_module(
+                    "mediapipe.python.solutions.drawing_styles"
+                )
+            except Exception as exc:
+                self.initialization_error = (
+                    "MediaPipe Hands API is unavailable. Use mediapipe==0.10.14 "
+                    f"or reinstall dependencies. Details: {exc}"
+                )
+                return
+
         try:
             self.hands = self.mp_hands.Hands(
                 static_image_mode=static_image_mode,
