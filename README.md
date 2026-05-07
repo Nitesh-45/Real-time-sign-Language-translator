@@ -23,7 +23,7 @@ The objective is to build a local real-time sign language translator MVP that ca
 - predict signs in real time
 - build simple sentence output
 - show emoji mapping
-- speak the sentence using text-to-speech
+- speak the sentence using browser text-to-speech
 - provide a quiz mode for practice
 
 ## Features
@@ -36,7 +36,8 @@ The objective is to build a local real-time sign language translator MVP that ca
 - Confidence-based prediction filtering
 - Sentence builder with duplicate control and cooldown
 - Emoji output for each detected sign
-- Text-to-speech using pyttsx3
+- Browser text-to-speech using the Web Speech API
+- Browser webcam support using WebRTC for public deployment
 - Beginner quiz mode with score and accuracy
 - Streamlit app with clean pages
 - Clear error messages for missing model, webcam issues, no hand, and low confidence
@@ -48,7 +49,7 @@ The objective is to build a local real-time sign language translator MVP that ca
 - MediaPipe Hands
 - scikit-learn
 - Streamlit
-- pyttsx3
+- streamlit-webrtc
 - NumPy
 - pandas
 - joblib
@@ -221,6 +222,20 @@ App pages:
 - Quiz Mode
 - About Project
 
+## Public Deployment Steps
+
+This app is now web-ready for Streamlit Community Cloud because Live Translator and Quiz Mode use the visitor's browser webcam through WebRTC.
+
+1. Push the latest code to GitHub.
+2. Open Streamlit Community Cloud: `https://share.streamlit.io`
+3. Click `Create app`.
+4. Select this repository and branch `main`.
+5. Set main file path to `app.py`.
+6. Use Python `3.10` in advanced settings if available.
+7. Click `Deploy`.
+
+After deployment, open the app URL, go to `Live Translator` or `Quiz Mode`, click `START` in the webcam box, and allow camera permission in the browser.
+
 ## Demo Workflow
 
 1. Run `streamlit run app.py`.
@@ -228,7 +243,7 @@ App pages:
 3. Collect samples from terminal for at least two signs, such as `water` and `help`.
 4. Train the model using `python src/train_model.py`.
 5. Open `Live Translator`.
-6. Click `Start Webcam`.
+6. Click `START` inside the browser webcam box.
 7. Perform a trained sign.
 8. Check detected sign, confidence, emoji, and generated sentence.
 9. Click `Speak Sentence`.
@@ -277,7 +292,9 @@ streamlit run app.py
 
 ### Webcam Not Opening
 
-Close other apps that may be using the camera, such as Zoom, Teams, or the Windows Camera app. Check Windows camera permissions, then try a different camera index in `config.py`:
+For the Streamlit web app, click `START` inside the webcam box and allow browser camera permission. On mobile or desktop, camera access usually requires `https://` or `localhost`.
+
+For terminal tools such as dataset collection, close other apps that may be using the camera, such as Zoom, Teams, or the Windows Camera app. If needed, try a different camera index in `config.py`:
 
 ```python
 CAMERA_INDEX = 1
@@ -299,9 +316,9 @@ python src/train_model.py
 
 Collect more samples with consistent gestures. Keep sample counts balanced across signs. Use similar lighting and background during collection and demo.
 
-### pyttsx3 Voice Not Working
+### Browser Voice Not Working
 
-pyttsx3 depends on system voice drivers. On Windows, check installed voices in system speech settings. If speech fails, the app continues running and shows a warning.
+The deployed app uses the browser Web Speech API. If voice does not play, check browser audio permission, unmute the tab, and click `Speak Sentence` after a sentence is generated.
 
 ### Streamlit Rerun Issues
 

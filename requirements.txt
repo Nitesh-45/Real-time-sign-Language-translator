@@ -1,8 +1,9 @@
-opencv-python
+streamlit
+streamlit-webrtc
+av
+opencv-python-headless==4.11.0.86
 mediapipe
 scikit-learn
-streamlit
-pyttsx3
-numpy
+numpy==1.26.4
 pandas
 joblib
