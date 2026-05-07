@@ -1,5 +1,7 @@
 # Real-Time Sign Language Translator
 
+Let's connect people together.
+
 A final-year B.Tech level Python MVP that recognizes selected useful hand signs using webcam input and converts them into text, emojis, simple sentences, speech output, and quiz feedback.
 
 This is a demo-ready learning project. It is not a complete sign language translation system.
