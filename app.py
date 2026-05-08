@@ -1,16 +1,14 @@
-import json
 import time
-from threading import Lock
 
 import cv2
 import streamlit as st
-import streamlit.components.v1 as components
 
 from config import CAMERA_INDEX, CONFIDENCE_THRESHOLD, ENCODER_PATH, MODEL_PATH
 from src.hand_tracker import HandTracker
 from src.predictor import SignPredictor
 from src.quiz_mode import QuizManager
 from src.sentence_builder import SentenceBuilder
+from src.text_to_speech import TextToSpeech
 from src.utils import (
     draw_status_box,
     ensure_directories,
@@ -19,28 +17,8 @@ from src.utils import (
     load_supported_labels,
 )
 
-try:
-    import av
-    from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, WebRtcMode, webrtc_streamer
-except Exception as exc:
-    av = None
-    RTCConfiguration = None
-    VideoProcessorBase = object
-    WebRtcMode = None
-    webrtc_streamer = None
-    WEBRTC_IMPORT_ERROR = exc
-else:
-    WEBRTC_IMPORT_ERROR = None
-
 
 APP_NAME = "Real-Time Sign Language Translator"
-WEBRTC_AVAILABLE = WEBRTC_IMPORT_ERROR is None
-WEBRTC_MEDIA_CONSTRAINTS = {"video": True, "audio": False}
-WEBRTC_RTC_CONFIGURATION = (
-    RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
-    if WEBRTC_AVAILABLE
-    else None
-)
 
 
 st.set_page_config(
@@ -766,6 +744,12 @@ def load_predictor(confidence_threshold: float) -> SignPredictor:
     return SignPredictor(confidence_threshold=confidence_threshold)
 
 
+@st.cache_resource(show_spinner=False)
+def load_tts() -> TextToSpeech:
+    """Load the local text-to-speech engine once."""
+    return TextToSpeech()
+
+
 def init_session_state() -> None:
     """Create stateful objects used across Streamlit reruns."""
     if "sentence_builder" not in st.session_state:
@@ -898,255 +882,6 @@ def release_quiz_resources() -> None:
         except Exception:
             pass
     st.session_state.quiz_tracker_obj = None
-
-
-def speak_in_browser(text: str) -> str:
-    """Speak text in the user's browser using the Web Speech API."""
-    clean_text = (text or "").strip()
-    if not clean_text:
-        return "Nothing to speak."
-
-    components.html(
-        f"""
-        <script>
-        const text = {json.dumps(clean_text)};
-        if ("speechSynthesis" in window) {{
-            window.speechSynthesis.cancel();
-            const utterance = new SpeechSynthesisUtterance(text);
-            utterance.rate = 0.9;
-            utterance.pitch = 1.0;
-            utterance.lang = "en-IN";
-            window.speechSynthesis.speak(utterance);
-        }}
-        </script>
-        """,
-        height=0,
-    )
-    return "Speaking sentence in browser."
-
-
-def stop_browser_speech() -> str:
-    """Stop browser speech output if it is active."""
-    components.html(
-        """
-        <script>
-        if ("speechSynthesis" in window) {
-            window.speechSynthesis.cancel();
-        }
-        </script>
-        """,
-        height=0,
-    )
-    return "Speech stopped."
-
-
-def render_webrtc_missing_message() -> None:
-    """Show a clean message when WebRTC dependencies are not installed."""
-    details = f" Error: {WEBRTC_IMPORT_ERROR}" if WEBRTC_IMPORT_ERROR else ""
-    render_empty_state(
-        "🌐",
-        "Browser webcam dependency missing",
-        "Install web dependencies with: pip install -r requirements.txt." + details,
-    )
-
-
-class LiveTranslatorVideoProcessor(VideoProcessorBase):
-    """Process browser webcam frames for the live translator."""
-
-    def __init__(self, predictor: SignPredictor, builder: SentenceBuilder) -> None:
-        self.predictor = predictor
-        self.builder = builder
-        self.tracker = HandTracker(draw_landmarks=True)
-        self.lock = Lock()
-        self.label = None
-        self.confidence = 0.0
-        self.status = "idle"
-        self.message = "Camera not started"
-        self.sentence = builder.get_sentence()
-
-    def recv(self, frame):
-        """Receive a browser webcam frame, annotate it, and return it."""
-        image = frame.to_ndarray(format="bgr24")
-        result = self.tracker.process_frame(image)
-        label = None
-        confidence = 0.0
-        status = "no_hand"
-
-        if result.keypoints is None:
-            message = "No hand detected"
-            overlay_text = message
-        else:
-            prediction = self.predictor.predict_from_landmarks(result.keypoints)
-            label = prediction["label"]
-            confidence = float(prediction["confidence"])
-            status = prediction["status"]
-            message = prediction_message(prediction)
-
-            if status == "success":
-                self.builder.add_word(label)
-
-            overlay_text = (
-                f"{format_sign_name(label)} ({confidence:.0%})"
-                if label
-                else message
-            )
-
-        draw_status_box(result.annotated_frame, overlay_text)
-        with self.lock:
-            self.label = label
-            self.confidence = confidence
-            self.status = status
-            self.message = message
-            self.sentence = self.builder.get_sentence()
-
-        return av.VideoFrame.from_ndarray(result.annotated_frame, format="bgr24")
-
-    def get_state(self) -> dict[str, object]:
-        """Return the latest prediction state for Streamlit UI rendering."""
-        with self.lock:
-            return {
-                "label": self.label,
-                "confidence": self.confidence,
-                "status": self.status,
-                "message": self.message,
-                "sentence": self.sentence,
-            }
-
-
-class QuizVideoProcessor(VideoProcessorBase):
-    """Process browser webcam frames for quiz mode."""
-
-    def __init__(
-        self,
-        predictor: SignPredictor,
-        quiz: QuizManager,
-        limit: int,
-        completed_questions: int,
-    ) -> None:
-        self.predictor = predictor
-        self.quiz = quiz
-        self.limit = limit
-        self.completed_questions = completed_questions
-        self.tracker = HandTracker(draw_landmarks=True)
-        self.lock = Lock()
-        self.label = None
-        self.confidence = 0.0
-        self.status = "idle"
-        self.feedback = "Camera started. Perform the target sign."
-        self.finished = False
-        self.stable_label = None
-        self.stable_count = 0
-        self.last_scored_pair = None
-        self.last_score_time = 0.0
-        self.answer_cooldown_seconds = 1.2
-
-    def update_settings(self, limit: int, completed_questions: int, finished: bool) -> None:
-        """Sync app-level quiz settings into the video processor."""
-        with self.lock:
-            self.limit = limit
-            self.completed_questions = completed_questions
-            self.finished = finished
-
-    def recv(self, frame):
-        """Receive a browser webcam frame, score stable answers, and return it."""
-        image = frame.to_ndarray(format="bgr24")
-        result = self.tracker.process_frame(image)
-
-        with self.lock:
-            is_finished = self.finished
-            limit = self.limit
-
-        if is_finished:
-            draw_status_box(result.annotated_frame, "Quiz complete")
-            return av.VideoFrame.from_ndarray(result.annotated_frame, format="bgr24")
-
-        label = None
-        confidence = 0.0
-        status = "no_hand"
-        feedback = "No hand detected"
-
-        if result.keypoints is None:
-            overlay_text = "No hand detected"
-            self.stable_label = None
-            self.stable_count = 0
-            self.last_scored_pair = None
-        else:
-            prediction = self.predictor.predict_from_landmarks(result.keypoints)
-            label = prediction["label"]
-            confidence = float(prediction["confidence"])
-            status = prediction["status"]
-            feedback = prediction_message(prediction)
-            overlay_text = (
-                f"{format_sign_name(label)} ({confidence:.0%})"
-                if label
-                else feedback
-            )
-
-            if status == "success":
-                feedback = f"Detected {format_sign_name(label)}"
-
-        if label and status == "success":
-            if label == self.stable_label:
-                self.stable_count += 1
-            else:
-                self.stable_label = label
-                self.stable_count = 1
-        else:
-            self.stable_label = None
-            self.stable_count = 0
-
-        current_target = self.quiz.get_current_question()
-        current_pair = (current_target, label)
-        ready_to_score = (
-            label
-            and status == "success"
-            and self.stable_count >= 3
-            and current_pair != self.last_scored_pair
-            and time.time() - self.last_score_time >= self.answer_cooldown_seconds
-        )
-
-        if ready_to_score:
-            answer = self.quiz.check_answer(label, confidence)
-            self.last_scored_pair = current_pair
-            self.last_score_time = time.time()
-
-            if answer.correct:
-                self.completed_questions += 1
-                if self.completed_questions >= limit:
-                    self.finished = True
-                    feedback = "Quiz complete. Final score is ready."
-                else:
-                    next_target = answer.next_question or self.quiz.get_current_question()
-                    feedback = (
-                        f"Correct! Question {self.completed_questions + 1}/{limit}: "
-                        f"{format_sign_name(next_target)} {get_emoji(next_target)}"
-                    )
-            else:
-                feedback = "Try again"
-
-            self.stable_label = None
-            self.stable_count = 0
-
-        draw_status_box(result.annotated_frame, overlay_text)
-        with self.lock:
-            self.label = label
-            self.confidence = confidence
-            self.status = status
-            self.feedback = feedback
-
-        return av.VideoFrame.from_ndarray(result.annotated_frame, format="bgr24")
-
-    def get_state(self) -> dict[str, object]:
-        """Return the latest quiz state for Streamlit UI rendering."""
-        with self.lock:
-            return {
-                "label": self.label,
-                "confidence": self.confidence,
-                "status": self.status,
-                "feedback": self.feedback,
-                "completed_questions": self.completed_questions,
-                "finished": self.finished,
-            }
 
 
 def model_files_exist() -> bool:
@@ -1424,7 +1159,7 @@ def render_home() -> None:
     features = [
         ("🎥", "Real-time Gesture Detection", "Detect trained signs directly from webcam input using hand landmarks."),
         ("📝", "Sentence Formation", "Convert detected signs into simple useful sentence output."),
-        ("🔊", "Text-to-Speech", "Speak the generated sentence in the user's browser."),
+        ("🔊", "Text-to-Speech", "Speak the generated sentence locally using pyttsx3."),
         ("🎯", "Quiz Learning Mode", "Practice beginner signs with target prompts, score, and accuracy."),
     ]
     for col, feature in zip(cols, features):
@@ -1466,7 +1201,7 @@ def render_live_translator() -> None:
             step=0.05,
         )
     with top_cols[1]:
-        render_metric_card("Camera", "Browser", "Works on deployed HTTPS apps")
+        frame_limit = st.slider("Camera batch", 30, 240, 90, step=30)
 
     predictor = load_predictor(confidence_threshold)
     if not predictor.model_loaded:
@@ -1475,39 +1210,49 @@ def render_live_translator() -> None:
             render_status_badge("error", f"🧠 {predictor.last_error}")
         return
 
-    if not WEBRTC_AVAILABLE:
-        render_webrtc_missing_message()
-        return
-
-    controls = st.columns([1, 1, 1])
+    controls = st.columns([1, 1, 1, 1, 1])
     with controls[0]:
-        if st.button("🔊 Speak Sentence", use_container_width=True):
-            st.session_state.live_speech_status = speak_in_browser(builder.get_sentence())
+        if st.button(
+            "🎥 Start Webcam",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state.live_camera_running,
+        ):
+            release_live_resources()
+            st.session_state.live_camera_running = True
+            st.session_state.live_last_status = "idle"
     with controls[1]:
+        if st.button(
+            "⏹️ Stop Camera",
+            use_container_width=True,
+            disabled=not st.session_state.live_camera_running,
+        ):
+            st.session_state.live_camera_running = False
+            st.session_state.live_last_status = "idle"
+            release_live_resources()
+            st.rerun()
+    with controls[2]:
+        if st.button("🔊 Speak Sentence", use_container_width=True):
+            tts = load_tts()
+            st.session_state.live_speech_status = tts.speak(builder.get_sentence())
+    with controls[3]:
         if st.button("🧹 Clear Sentence", use_container_width=True):
             builder.clear_sentence()
             st.session_state.live_last_label = None
             st.session_state.live_last_confidence = 0.0
             st.session_state.live_last_status = "idle"
             st.success("Sentence cleared.")
-    with controls[2]:
+    with controls[4]:
         if st.button("🔇 Stop Voice", use_container_width=True):
-            st.session_state.live_speech_status = stop_browser_speech()
+            st.session_state.live_speech_status = load_tts().stop()
 
     if st.session_state.live_speech_status:
         st.info(st.session_state.live_speech_status)
 
     left, right = st.columns([1.45, 1], gap="large")
     with left:
-        st.markdown('<div class="section-title">Browser Webcam Feed</div>', unsafe_allow_html=True)
-        ctx = webrtc_streamer(
-            key="live-translator-browser-webcam",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=WEBRTC_RTC_CONFIGURATION,
-            media_stream_constraints=WEBRTC_MEDIA_CONSTRAINTS,
-            video_processor_factory=lambda: LiveTranslatorVideoProcessor(predictor, builder),
-            async_processing=True,
-        )
+        st.markdown('<div class="section-title">Webcam Feed</div>', unsafe_allow_html=True)
+        video_slot = st.empty()
         instruction_slot = st.empty()
     with right:
         st.markdown('<div class="section-title">Prediction Panel</div>', unsafe_allow_html=True)
@@ -1524,60 +1269,119 @@ def render_live_translator() -> None:
         st.markdown('<div class="section-title">Generated Sentence</div>', unsafe_allow_html=True)
         render_sentence_box(builder.get_sentence())
 
-    if not ctx.state.playing:
+    if not st.session_state.live_camera_running:
         with instruction_slot.container():
             render_empty_state(
                 "🎥",
                 "Camera not started",
-                "Click START in the webcam box and allow browser camera permission.",
+                "Click Start Webcam to begin. Use Stop Camera to end manually.",
             )
         return
 
-    if ctx.video_processor is None:
+    tracker = get_live_tracker()
+    camera = get_live_camera()
+    if camera is None:
+        st.session_state.live_camera_running = False
+        release_live_resources()
         with instruction_slot.container():
             render_empty_state(
                 "📷",
-                "Waiting for browser stream",
-                "If prompted, allow camera access in the browser.",
+                "Webcam unavailable",
+                "Check camera permission, close other camera apps, or update CAMERA_INDEX.",
             )
         return
 
-    while ctx.state.playing:
-        state = ctx.video_processor.get_state()
-        label = state["label"]
-        confidence = float(state["confidence"])
-        status = str(state["status"])
-        sentence = str(state["sentence"])
+    read_failures = 0
 
-        st.session_state.live_last_label = label
-        st.session_state.live_last_confidence = confidence
-        st.session_state.live_last_status = status
+    try:
+        for _ in range(frame_limit):
+            ok, frame = camera.read()
+            if not ok or frame is None:
+                read_failures += 1
+                with instruction_slot.container():
+                    render_empty_state(
+                        "📷",
+                        "Waiting for camera frame",
+                        "The webcam missed a frame. Keeping the camera session alive.",
+                    )
+                if read_failures >= 20:
+                    with instruction_slot.container():
+                        render_empty_state(
+                            "📷",
+                            "Camera stream interrupted",
+                            "Restart webcam or close any other app using the camera.",
+                        )
+                    st.session_state.live_camera_running = False
+                    release_live_resources()
+                    break
+                time.sleep(0.05)
+                continue
 
-        with instruction_slot.container():
-            if status == "success":
-                render_status_badge("success", "✅ Sign detected")
-            elif status == "low_confidence":
-                render_empty_state(
-                    "⚠️",
-                    "Low confidence",
-                    "Hold the gesture steady and keep the hand inside the frame.",
-                )
-            elif status == "no_hand":
-                render_empty_state(
-                    "✋",
-                    "No hand detected",
-                    "Show one hand clearly inside the camera frame.",
-                )
+            read_failures = 0
+
+            result = tracker.process_frame(frame)
+            label = None
+            confidence = 0.0
+            status = "no_hand"
+
+            if result.keypoints is None:
+                message = "No hand detected"
+                overlay_text = message
+                label = st.session_state.live_last_label
+                confidence = float(st.session_state.live_last_confidence)
             else:
-                render_status_badge("info", "🎥 Browser camera running")
+                prediction = predictor.predict_from_landmarks(result.keypoints)
+                label = prediction["label"]
+                confidence = float(prediction["confidence"])
+                status = prediction["status"]
+                message = prediction_message(prediction)
 
-        with prediction_slot.container():
-            render_prediction_card(label, confidence, status)
-        with sentence_slot.container():
-            st.markdown('<div class="section-title">Generated Sentence</div>', unsafe_allow_html=True)
-            render_sentence_box(sentence)
+                if status == "success":
+                    builder.add_word(label)
 
-        time.sleep(0.25)
+                overlay_text = (
+                    f"{format_sign_name(label)} ({confidence:.0%})"
+                    if label
+                    else message
+                )
+
+            if status == "success":
+                st.session_state.live_last_label = label
+                st.session_state.live_last_confidence = confidence
+            st.session_state.live_last_status = status
+
+            draw_status_box(result.annotated_frame, overlay_text)
+            # Older Streamlit versions use use_column_width for st.image.
+            video_slot.image(frame_to_rgb(result.annotated_frame), channels="RGB", use_column_width=True)
+
+            with instruction_slot.container():
+                if status == "success":
+                    render_status_badge("success", "✅ Sign detected")
+                elif status == "low_confidence":
+                    render_empty_state(
+                        "⚠️",
+                        "Low confidence",
+                        "Hold the gesture steady and keep the hand inside the frame.",
+                    )
+                else:
+                    render_empty_state(
+                        "✋",
+                        "No hand detected",
+                        "Show one hand clearly inside the camera frame.",
+                    )
+
+            with prediction_slot.container():
+                render_prediction_card(label, confidence, status)
+            with sentence_slot.container():
+                st.markdown('<div class="section-title">Generated Sentence</div>', unsafe_allow_html=True)
+                render_sentence_box(builder.get_sentence())
+
+            time.sleep(0.03)
+    finally:
+        pass
+
+    if st.session_state.live_camera_running:
+        st.rerun()
 
 
 def render_dataset_collector_guide() -> None:
@@ -1786,24 +1590,43 @@ def render_quiz_mode() -> None:
         float(st.session_state.quiz_last_confidence),
     )
 
-    if not WEBRTC_AVAILABLE:
-        render_webrtc_missing_message()
-        return
-
-    controls = st.columns([1, 1, 1, 2])
+    controls = st.columns([1, 1, 1, 1, 1, 2])
     with controls[0]:
+        if st.button(
+            "🎥 Start Webcam",
+            type="primary",
+            use_container_width=True,
+            disabled=st.session_state.quiz_camera_running or st.session_state.quiz_finished,
+        ):
+            release_quiz_resources()
+            st.session_state.quiz_camera_running = True
+            st.session_state.quiz_feedback = "Camera started. Perform the target sign."
+    with controls[1]:
+        if st.button(
+            "⏹️ Stop Camera",
+            use_container_width=True,
+            disabled=not st.session_state.quiz_camera_running,
+        ):
+            st.session_state.quiz_camera_running = False
+            st.session_state.quiz_feedback = "Camera stopped."
+            release_quiz_resources()
+            st.rerun()
+    with controls[2]:
         if st.button("🔄 Reset Quiz", use_container_width=True):
             reset_quiz_session(quiz)
             st.rerun()
-    with controls[1]:
+    with controls[3]:
         if st.button(
             "⏭️ Skip Sign",
             use_container_width=True,
             disabled=st.session_state.quiz_finished,
         ):
+            was_running = st.session_state.quiz_camera_running
             skip_quiz_question(quiz)
+            if not st.session_state.quiz_finished:
+                st.session_state.quiz_camera_running = was_running
             st.rerun()
-    with controls[2]:
+    with controls[4]:
         selected_limit = st.selectbox(
             "Question limit",
             [5, 10, 12],
@@ -1813,103 +1636,187 @@ def render_quiz_mode() -> None:
             st.session_state.quiz_limit = selected_limit
             reset_quiz_session(quiz, f"New learner session set to {selected_limit} questions.")
             st.rerun()
-    with controls[3]:
-        render_metric_card("Camera", "Browser", "Use START/STOP inside webcam box")
+    with controls[5]:
+        quiz_frame_limit = st.slider("Camera batch", 30, 240, 90, step=30)
 
     feedback_slot = st.empty()
     with feedback_slot.container():
         render_status_badge("info", f"ℹ️ {st.session_state.quiz_feedback}")
 
-    quiz_limit = int(st.session_state.get("quiz_limit", 5))
-    quiz_completed = int(st.session_state.get("quiz_completed_questions", 0))
-
-    st.markdown('<div class="section-title">Browser Webcam Feed</div>', unsafe_allow_html=True)
-    ctx = webrtc_streamer(
-        key="quiz-browser-webcam",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration=WEBRTC_RTC_CONFIGURATION,
-        media_stream_constraints=WEBRTC_MEDIA_CONSTRAINTS,
-        video_processor_factory=lambda: QuizVideoProcessor(
-            predictor,
-            quiz,
-            quiz_limit,
-            quiz_completed,
-        ),
-        async_processing=True,
-    )
-    result_slot = st.empty()
+    video_slot = st.empty()
 
     if st.session_state.quiz_finished:
         with feedback_slot.container():
             render_status_badge("success", "✅ Quiz complete. Review your score or reset to practice again.")
-        with result_slot.container():
+        with video_slot.container():
             render_quiz_final_result(quiz)
         return
 
-    if not ctx.state.playing:
-        with result_slot.container():
+    if not st.session_state.quiz_camera_running:
+        with video_slot.container():
             render_empty_state(
                 "🎥",
                 "Camera not started",
-                "Click START in the webcam box and allow browser camera permission.",
+                "Click Start Webcam when you are ready. Use Stop Camera to end manually.",
             )
         return
 
-    if ctx.video_processor is None:
-        with result_slot.container():
+    tracker = get_quiz_tracker()
+    camera = get_quiz_camera()
+    if camera is None:
+        st.session_state.quiz_camera_running = False
+        release_quiz_resources()
+        with feedback_slot.container():
             render_empty_state(
                 "📷",
-                "Waiting for browser stream",
-                "If prompted, allow camera access in the browser.",
+                "Webcam unavailable",
+                "Check camera permission, close other camera apps, or update CAMERA_INDEX.",
             )
         return
 
-    while ctx.state.playing:
-        ctx.video_processor.update_settings(
-            int(st.session_state.get("quiz_limit", 5)),
-            int(st.session_state.get("quiz_completed_questions", 0)),
-            bool(st.session_state.get("quiz_finished", False)),
-        )
-        state = ctx.video_processor.get_state()
-        label = state["label"]
-        confidence = float(state["confidence"])
-        status = str(state["status"])
-        st.session_state.quiz_last_label = label
-        st.session_state.quiz_last_confidence = confidence
-        st.session_state.quiz_feedback = str(state["feedback"])
-        st.session_state.quiz_completed_questions = int(state["completed_questions"])
-        st.session_state.quiz_finished = bool(state["finished"])
+    stable_label = None
+    stable_count = 0
+    last_scored_pair = None
+    last_score_time = 0.0
+    answer_cooldown_seconds = 1.2
+    read_failures = 0
 
-        with score_slot.container():
-            render_quiz_score(quiz)
-        update_quiz_cards(quiz.get_current_question(), label, confidence)
+    try:
+        for _ in range(quiz_frame_limit):
+            ok, frame = camera.read()
+            if not ok or frame is None:
+                read_failures += 1
+                with feedback_slot.container():
+                    render_empty_state(
+                        "📷",
+                        "Waiting for camera frame",
+                        "The webcam missed a frame. Keeping quiz mode alive.",
+                    )
+                if read_failures >= 20:
+                    with feedback_slot.container():
+                        render_empty_state(
+                            "📷",
+                            "Camera stream interrupted",
+                            "Restart webcam or close any other app using the camera.",
+                        )
+                    st.session_state.quiz_camera_running = False
+                    release_quiz_resources()
+                    break
+                time.sleep(0.05)
+                continue
 
-        with feedback_slot.container():
-            if st.session_state.quiz_finished:
-                render_status_badge("success", "✅ Quiz complete. Final score is ready.")
-            elif status == "success":
-                render_status_badge("info", f"👀 {st.session_state.quiz_feedback}")
-            elif status == "low_confidence":
-                render_empty_state(
-                    "⚠️",
-                    "Low confidence",
-                    "Hold the target sign steady and try again.",
-                )
-            elif status == "no_hand":
-                render_empty_state(
-                    "✋",
-                    "No hand detected",
-                    "Show one hand clearly inside the camera frame.",
-                )
+            read_failures = 0
+
+            result = tracker.process_frame(frame)
+            label = None
+            confidence = 0.0
+            status = "no_hand"
+
+            if result.keypoints is None:
+                overlay_text = "No hand detected"
+                with feedback_slot.container():
+                    render_empty_state(
+                        "✋",
+                        "No hand detected",
+                        "Show one hand clearly inside the camera frame.",
+                    )
+                stable_label = None
+                stable_count = 0
+                last_scored_pair = None
             else:
-                render_status_badge("info", f"ℹ️ {st.session_state.quiz_feedback}")
+                prediction = predictor.predict_from_landmarks(result.keypoints)
+                label = prediction["label"]
+                confidence = float(prediction["confidence"])
+                status = prediction["status"]
+                overlay_text = (
+                    f"{format_sign_name(label)} ({confidence:.0%})"
+                    if label
+                    else prediction_message(prediction)
+                )
 
-        if st.session_state.quiz_finished:
-            with result_slot.container():
-                render_quiz_final_result(quiz)
-            break
+                if status == "low_confidence":
+                    with feedback_slot.container():
+                        render_empty_state(
+                            "⚠️",
+                            "Low confidence",
+                            "Hold the target sign steady and try again.",
+                        )
+                elif status == "success":
+                    with feedback_slot.container():
+                        render_status_badge("info", f"👀 Detected {format_sign_name(label)}")
 
-        time.sleep(0.25)
+            st.session_state.quiz_last_label = label
+            st.session_state.quiz_last_confidence = confidence
+            update_quiz_cards(quiz.get_current_question(), label, confidence)
+
+            if label and status == "success":
+                if label == stable_label:
+                    stable_count += 1
+                else:
+                    stable_label = label
+                    stable_count = 1
+            else:
+                stable_label = None
+                stable_count = 0
+
+            draw_status_box(result.annotated_frame, overlay_text)
+            # Older Streamlit versions use use_column_width for st.image.
+            video_slot.image(frame_to_rgb(result.annotated_frame), channels="RGB", use_column_width=True)
+
+            current_target = quiz.get_current_question()
+            current_pair = (current_target, label)
+            ready_to_score = (
+                label
+                and status == "success"
+                and stable_count >= 3
+                and current_pair != last_scored_pair
+                and time.time() - last_score_time >= answer_cooldown_seconds
+            )
+
+            if ready_to_score:
+                answer = quiz.check_answer(label, confidence)
+                last_scored_pair = current_pair
+                last_score_time = time.time()
+                with score_slot.container():
+                    render_quiz_score(quiz)
+                if answer.correct:
+                    st.session_state.quiz_completed_questions += 1
+                    completed = int(st.session_state.quiz_completed_questions)
+                    limit = int(st.session_state.quiz_limit)
+                    next_target = answer.next_question or quiz.get_current_question()
+                    with score_slot.container():
+                        render_quiz_score(quiz)
+
+                    if completed >= limit:
+                        st.session_state.quiz_finished = True
+                        st.session_state.quiz_camera_running = False
+                        release_quiz_resources()
+                        st.session_state.quiz_feedback = "Quiz complete. Final score is ready."
+                        with feedback_slot.container():
+                            render_status_badge("success", "✅ Quiz complete. Final score is ready.")
+                            render_quiz_final_result(quiz)
+                        break
+
+                    st.session_state.quiz_feedback = (
+                        f"Correct! Question {completed + 1}/{limit}: "
+                        f"{format_sign_name(next_target)} {get_emoji(next_target)}"
+                    )
+                    with feedback_slot.container():
+                        render_status_badge("success", f"✅ {st.session_state.quiz_feedback}")
+                    update_quiz_cards(next_target, label, confidence)
+                else:
+                    st.session_state.quiz_feedback = "Try again"
+                    with feedback_slot.container():
+                        render_status_badge("error", "❌ Try again")
+                stable_label = None
+                stable_count = 0
+
+            time.sleep(0.03)
+    finally:
+        pass
+
+    if st.session_state.quiz_camera_running and not st.session_state.quiz_finished:
+        st.rerun()
 
 
 def render_about_project() -> None:
